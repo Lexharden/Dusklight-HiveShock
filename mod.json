@@ -1,0 +1,10 @@
+{
+  "id": "com.hiveshock.interactive",
+  "name": "HiveShock",
+  "version": "1.2.0",
+  "author": "Yafel GH",
+  "description": "Interactive stream mod — receive TCP commands from external services (donations, chat events) and translate them into in-game actions like spawning enemies, items, or applying effects to the player.",
+  "icon": "res/icon.png",
+  "entry_point": "hiveshock",
+  "dependencies": []
+}
