@@ -109,7 +109,7 @@ constexpr size_t kMaxDeferredEvents = 32;
 constexpr std::chrono::seconds kDeferredEventTimeout{15};
 
 /// Version string shown in logs.
-constexpr const char* kModVersion = "1.2.0";
+constexpr const char* kModVersion = "1.3.0";
 
 /// TCP listen port.
 constexpr uint16_t kListenPort = 43000;

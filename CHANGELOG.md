@@ -2,7 +2,7 @@
 
 Versioning: [SemVer](https://semver.org). The version lives in `mod.json`; tag releases as `vX.Y.Z`.
 
-## Unreleased
+## 1.3.0
 
 ### Added
 - Linux (x64, arm64) and macOS (Apple Silicon, Intel) builds.
