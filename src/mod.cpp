@@ -21,6 +21,7 @@
 #include <mods/svc/log.hpp>
 #include <mods/svc/hook.h>
 #include <mods/svc/hook.hpp>
+#include <mods/svc/host.h>
 
 // --- HiveShock modules ---
 #include "logging.hpp"
@@ -53,6 +54,12 @@ DEFINE_MOD();
 // =============================================================================
 IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
+#ifndef _WIN32
+// Linux/macOS only: HostService::data_dir (minor 2) gives a writable folder for
+// the forensic/crash logs. Optional so an older host still loads the mod; the
+// logs then fall back to the Dusklight user folder (see crash_handler.hpp).
+IMPORT_OPTIONAL_SERVICE(HostService, svc_host);
+#endif
 
 // =============================================================================
 // Hook declaration — we intercept the main game-loop tick function so we can
@@ -102,7 +109,7 @@ constexpr size_t kMaxDeferredEvents = 32;
 constexpr std::chrono::seconds kDeferredEventTimeout{15};
 
 /// Version string shown in logs.
-constexpr const char* kModVersion = "1.2.0";
+constexpr const char* kModVersion = "1.3.0";
 
 /// TCP listen port.
 constexpr uint16_t kListenPort = 43000;
@@ -356,9 +363,29 @@ MOD_EXPORT ModResult mod_initialize(ModError* out_error) {
     g_mainThreadId = std::this_thread::get_id();
 
     // ---- Initialize crash handler & forensic logger ----
+#ifndef _WIN32
+    // Must happen before the first log is opened. On Windows the logs stay
+    // next to the executable, as before.
+    if (svc_host != nullptr) {
+        const char* dataDir = nullptr;
+        if (svc_host->data_dir(mod_ctx, &dataDir) == MOD_OK && dataDir != nullptr) {
+            hiveshock::configureLogDirectory(dataDir);
+        } else {
+            DUSK_LOG_WARN("[HiveShock] No mod data folder from the host; logs go to the Dusklight user folder.");
+        }
+    }
+#endif
     hiveshock::CrashHandler::instance().init();
     hiveshock::ForensicLog::instance(); // Force init of the forensic log file
     DUSK_LOG_INFO("[HiveShock] Crash handler installed, forensic logger active.");
+    if (const char* p = hiveshock::ForensicLog::instance().path()) {
+        DUSK_LOG_INFO("[HiveShock] Forensic log: %s", p);
+    } else {
+        DUSK_LOG_WARN("[HiveShock] Forensic log could not be opened; tracing disabled.");
+    }
+    if (const char* p = hiveshock::CrashHandler::instance().logPath()) {
+        DUSK_LOG_INFO("[HiveShock] Crash log: %s", p);
+    }
     HIVESHOCK_CHECKPOINT("mod_initialize::crash_handler_ready");
 
     // ---- Create effect dispatcher ----
@@ -369,6 +396,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* out_error) {
     if (!g_netBridge->start()) {
         const char* msg = "Failed to start TCP server on port 43000";
         DUSK_LOG_ERROR("[HiveShock] %s", msg);
+        // mod_shutdown() does not run after a failed init, so take the crash
+        // handler down here — it must not outlive the library it lives in.
+        g_netBridge.reset();
+        g_effects.reset();
+        hiveshock::CrashHandler::instance().shutdown();
         return mods::set_error(out_error, MOD_ERROR, msg);
     }
 
@@ -446,6 +478,10 @@ MOD_EXPORT ModResult mod_shutdown([[maybe_unused]] ModError* out_error) {
     g_frameEvents.clear();
     g_frameEvents.shrink_to_fit();
     g_deferredEvents.clear();
+
+    // Last: put back the crash handler that was there before us, so nothing
+    // points into this library once the host unloads it.
+    hiveshock::CrashHandler::instance().shutdown();
 
     DUSK_LOG_INFO("[HiveShock] Shutdown complete. Goodbye!");
     return MOD_OK;

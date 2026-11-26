@@ -10,6 +10,11 @@
 # local Dusklight checkout instead:  cmake -B build -S . -DDUSKLIGHT_DIR=D:/path/to/dusklight
 # =============================================================================
 cmake_minimum_required(VERSION 3.25)
+
+# macOS: oldest version the mod loads on — same as Dusklight's own macOS build. Must be set
+# before project(). Ignored on other platforms.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version (matches Dusklight)")
+
 project(hiveshock CXX)
 
 # Dusklight commit this mod is built and tested against (v2.0.0).
