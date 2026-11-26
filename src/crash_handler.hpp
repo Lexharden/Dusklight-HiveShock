@@ -517,7 +517,7 @@ public:
         for (int i = 0; i < kNumSignals; ++i) {
             struct sigaction sa{};
             sa.sa_sigaction = &CrashHandler::signalHandler;
-            ::sigemptyset(&sa.sa_mask);
+            sigemptyset(&sa.sa_mask);
             // SA_ONSTACK: use the thread's alternate stack if it has one (Crashpad
             // sets one up), so a stack overflow can still be reported.
             sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -807,7 +807,7 @@ private:
         // soon as it returns.
         struct sigaction dfl{};
         dfl.sa_handler = SIG_DFL;
-        ::sigemptyset(&dfl.sa_mask);
+        sigemptyset(&dfl.sa_mask);
         ::sigaction(sig, &dfl, nullptr);
         ::raise(sig);
     }
