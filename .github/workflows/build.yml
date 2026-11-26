@@ -21,15 +21,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, platform: win-x64 }
-          # - { os: ubuntu-24.04,     platform: linux-x64 }
-          # - { os: ubuntu-24.04-arm, platform: linux-arm64 }
-          # - { os: macos-latest,     platform: macos-arm64 }
+          # Same runners/compilers Dusklight itself is built with (MSVC, GCC, AppleClang).
+          - { os: windows-latest,   platform: win-x64 }
+          - { os: ubuntu-24.04,     platform: linux-x64 }
+          - { os: ubuntu-24.04-arm, platform: linux-arm64 }
+          - { os: macos-latest,     platform: macos-arm64 }
+          # Intel Mac: cross-compiled on the arm64 runner (the SDK rejects universal binaries).
+          - { os: macos-latest,     platform: macos-x64, cmake_args: '-DCMAKE_OSX_ARCHITECTURES=x86_64' }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
 
       - name: Build
         run: cmake --build build --config Release --target hiveshock_package

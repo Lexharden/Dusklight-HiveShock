@@ -1,18 +1,30 @@
 // =============================================================================
 // HiveShock Mod for Dusklight v2.0.0
-// crash_handler.hpp — SEH crash handler & unbuffered forensic logger
+// crash_handler.hpp — crash handler & unbuffered forensic logger
 //
-// Provides three safety layers:
+// Provides three safety layers, on every platform:
 //   1. ForensicLog: Unbuffered file logger that survives crashes.
-//   2. CrashHandler: Windows SEH filter that dumps state on fatal exceptions.
+//   2. CrashHandler: Dumps state on fatal faults, then hands the crash on to
+//      whatever handler was installed before it (Crashpad, WER, default):
+//        - Windows:     unhandled-exception (SEH) filter.
+//        - Linux/macOS: sigaction() on SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT.
+//      It only *reports* — it never resumes execution after a fault.
 //   3. Command ring buffer: Records last 16 commands for post-mortem analysis.
+//
+// Where the logs go:
+//   - Windows:     next to the game executable.
+//   - Linux/macOS: the mod's persistent data folder (HostService::data_dir),
+//                  passed in through configureLogDirectory() before init().
+//                  The folder next to the executable is read-only there (a
+//                  signed .app bundle, /usr, an AppImage). If the host does
+//                  not provide a folder, the Dusklight user folder is used.
 //
 // Copyright (c) 2026 HiveShock Contributors — MIT License
 // =============================================================================
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Platform detection
+// Platform headers
 // ---------------------------------------------------------------------------
 #ifdef _WIN32
 
@@ -28,12 +40,28 @@
 #endif
 #include <Windows.h>
 
-#include <cstdio>
+#else // POSIX (Linux, macOS)
+
+#include <fcntl.h>
+#include <signal.h>
+#include <time.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h> // <ucontext.h> is deprecated on macOS and needs _XOPEN_SOURCE
+#else
+#include <ucontext.h>
+#endif
+
+#endif // _WIN32
+
+#include <atomic>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <atomic>
 #include <mutex>
 
 namespace hiveshock {
@@ -41,9 +69,30 @@ namespace hiveshock {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr int kCommandRingSize  = 16;
-static constexpr int kFmtBufSize       = 1024;
-static constexpr int kPathBufSize      = MAX_PATH;
+static constexpr int kCommandRingSize = 16;
+static constexpr int kFmtBufSize      = 1024;
+#ifdef _WIN32
+static constexpr int kPathBufSize     = MAX_PATH;
+#else
+static constexpr int kPathBufSize     = 1024;
+#endif
+static constexpr const char* kCrashLogName    = "hiveshock_crash.log";
+static constexpr const char* kForensicLogName = "hiveshock_forensic.log";
+
+// ---------------------------------------------------------------------------
+// monotonicMs — milliseconds since an arbitrary start point (boot on most
+// systems). Async-signal-safe on POSIX: clock_gettime() is on the safe list.
+// ---------------------------------------------------------------------------
+inline uint64_t monotonicMs() noexcept {
+#ifdef _WIN32
+    return ::GetTickCount64();
+#else
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000u +
+           static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
+#endif
+}
 
 // ---------------------------------------------------------------------------
 // CommandRecord — stored in the ring buffer (POD, no allocations)
@@ -68,7 +117,7 @@ struct CommandRing {
         entries[slot].commandId[sizeof(entries[slot].commandId) - 1] = '\0';
         std::strncpy(entries[slot].sender,    senderName ? senderName : "(null)", sizeof(entries[slot].sender) - 1);
         entries[slot].sender[sizeof(entries[slot].sender) - 1] = '\0';
-        entries[slot].tickCount = ::GetTickCount64();
+        entries[slot].tickCount = monotonicMs();
     }
 };
 
@@ -81,17 +130,154 @@ inline CommandRing& commandRing() noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: crash-safe timestamp (stack-only, no allocations)
+// Helpers: local-time timestamp for normal (non-crash) log lines.
+// Not async-signal-safe on POSIX (localtime_r takes the tz lock) — the
+// signal handler uses detail::writeUtcTimestamp() instead.
 // ---------------------------------------------------------------------------
 inline void formatTimestamp(char* buf, size_t bufLen) noexcept {
+#ifdef _WIN32
     SYSTEMTIME st;
     ::GetLocalTime(&st);
     std::snprintf(buf, bufLen,
         "%04d-%02d-%02d %02d:%02d:%02d.%03d",
         st.wYear, st.wMonth, st.wDay,
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+#else
+    timespec ts{};
+    ::clock_gettime(CLOCK_REALTIME, &ts);
+    const time_t secs = ts.tv_sec;
+    std::tm tmv{};
+    ::localtime_r(&secs, &tmv);
+    std::snprintf(buf, bufLen,
+        "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+        tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+        static_cast<int>(ts.tv_nsec / 1000000));
+#endif
 }
 
+// ---------------------------------------------------------------------------
+// Log file location
+// ---------------------------------------------------------------------------
+namespace detail {
+
+/// Directory the logs go to, always ending in a separator; empty = default.
+/// Only used on POSIX (see the header comment).
+inline char g_logDir[kPathBufSize] = {};
+
+/// Appends src to the NUL-terminated dst. Leaves dst untouched and returns
+/// false if the result would not fit.
+inline bool appendPath(char* dst, size_t cap, const char* src) noexcept {
+    const size_t len = std::strlen(dst);
+    const size_t add = std::strlen(src);
+    if (len + add + 1 > cap) return false;
+    std::memcpy(dst + len, src, add + 1);
+    return true;
+}
+
+#ifndef _WIN32
+/// The Dusklight user folder — the parent of the mods folder from the README.
+inline bool defaultUserDir(char* out, size_t cap) noexcept {
+    out[0] = '\0';
+    const char* home = std::getenv("HOME");
+#if defined(__APPLE__)
+    if (home == nullptr || home[0] == '\0') return false;
+    return appendPath(out, cap, home) &&
+           appendPath(out, cap, "/Library/Application Support/TwilitRealm/Dusklight/");
+#else
+    const char* xdg = std::getenv("XDG_DATA_HOME");
+    if (xdg != nullptr && xdg[0] == '/') { // XDG spec: relative paths are invalid, ignore them
+        return appendPath(out, cap, xdg) && appendPath(out, cap, "/TwilitRealm/Dusklight/");
+    }
+    if (home == nullptr || home[0] == '\0') return false;
+    return appendPath(out, cap, home) &&
+           appendPath(out, cap, "/.local/share/TwilitRealm/Dusklight/");
+#endif
+}
+#endif
+
+/// Builds "<log dir><fileName>" into out. Returns false (out = "") when no
+/// directory could be resolved.
+inline bool buildLogPath(char* out, size_t cap, const char* fileName) noexcept {
+    out[0] = '\0';
+#ifdef _WIN32
+    const DWORD len = ::GetModuleFileNameA(nullptr, out, static_cast<DWORD>(cap));
+    if (len == 0 || len >= cap) { out[0] = '\0'; return false; }
+    char* lastSlash = std::strrchr(out, '\\');
+    if (lastSlash == nullptr) { out[0] = '\0'; return false; }
+    *(lastSlash + 1) = '\0'; // strip the executable name, keep the directory
+#else
+    if (g_logDir[0] != '\0') {
+        appendPath(out, cap, g_logDir); // always fits: same capacity
+    } else if (!defaultUserDir(out, cap)) {
+        out[0] = '\0';
+        return false;
+    }
+#endif
+    if (!appendPath(out, cap, fileName)) { out[0] = '\0'; return false; }
+    return true;
+}
+
+/// Opens a log in append mode, fully unbuffered. pathOut receives the path
+/// actually used. Falls back to the current directory only when no log
+/// directory could be resolved at all.
+inline std::FILE* openLogFile(const char* fileName, char* pathOut, size_t cap) noexcept {
+    if (!buildLogPath(pathOut, cap, fileName)) {
+        pathOut[0] = '\0';
+        appendPath(pathOut, cap, fileName);
+    }
+    std::FILE* f = std::fopen(pathOut, "a");
+    if (f != nullptr) {
+        // Fully unbuffered — every write goes straight to the OS
+        std::setvbuf(f, nullptr, _IONBF, 0);
+#ifndef _WIN32
+        const int fd = ::fileno(f);
+        if (fd >= 0) ::fcntl(fd, F_SETFD, FD_CLOEXEC); // don't leak into child processes
+#endif
+    }
+    return f;
+}
+
+} // namespace detail
+
+/// Sets where the logs go. Must be called before CrashHandler::init() and the
+/// first ForensicLog use. No-op on Windows, where the logs stay next to the
+/// executable.
+inline void configureLogDirectory([[maybe_unused]] const char* dir) noexcept {
+#ifndef _WIN32
+    detail::g_logDir[0] = '\0';
+    if (dir == nullptr || dir[0] == '\0') return;
+    if (!detail::appendPath(detail::g_logDir, sizeof(detail::g_logDir), dir)) {
+        detail::g_logDir[0] = '\0';
+        return;
+    }
+    const size_t len = std::strlen(detail::g_logDir);
+    if (detail::g_logDir[len - 1] != '/' &&
+        !detail::appendPath(detail::g_logDir, sizeof(detail::g_logDir), "/")) {
+        detail::g_logDir[0] = '\0';
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// CrashContext
+// ---------------------------------------------------------------------------
+// Externally settable pointers for post-mortem inspection. The game layer
+// should update these as state changes; the crash handler reads them with no
+// locking (plain pointer reads are safe enough during a crash dump — we only
+// need a best-effort snapshot).
+// ---------------------------------------------------------------------------
+struct CrashContext {
+    const void*   playerPtr   = nullptr;
+    const char*   stageName   = "(unknown)";
+};
+
+inline CrashContext& crashContext() noexcept {
+    static CrashContext ctx;
+    return ctx;
+}
+
+#ifdef _WIN32
 // ---------------------------------------------------------------------------
 // Helpers: translate an exception code to a human-readable name
 // ---------------------------------------------------------------------------
@@ -122,24 +308,196 @@ inline const char* exceptionCodeName(DWORD code) noexcept {
     }
 }
 
+#else // POSIX
+
+namespace detail {
+
 // ---------------------------------------------------------------------------
-// CrashHandler — Windows SEH singleton
+// SignalSafeWriter — formats into a stack buffer and write()s it out.
+// Uses no stdio, no locale, no heap: everything here is async-signal-safe,
+// which a handler running *inside* a crashed process needs (the crash may
+// have happened while malloc's or stdio's lock was held).
 // ---------------------------------------------------------------------------
-// Externally settable pointers for post-mortem inspection. The game layer
-// should update these as state changes; the crash handler reads them in the
-// SEH callback with no locking (plain pointer reads are safe enough during a
-// crash dump — we only need a best-effort snapshot).
-// ---------------------------------------------------------------------------
-struct CrashContext {
-    const void*   playerPtr   = nullptr;
-    const char*   stageName   = "(unknown)";
+struct SignalSafeWriter {
+    int    fd;
+    char   buf[512];
+    size_t len = 0;
+
+    explicit SignalSafeWriter(int f) noexcept : fd(f) {}
+
+    void flush() noexcept {
+        size_t off = 0;
+        while (off < len) {
+            const ssize_t n = ::write(fd, buf + off, len - off);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            off += static_cast<size_t>(n);
+        }
+        len = 0;
+    }
+
+    void ch(char c) noexcept {
+        if (len == sizeof(buf)) flush();
+        buf[len++] = c;
+    }
+
+    void str(const char* s) noexcept {
+        if (s == nullptr) s = "(null)";
+        while (*s != '\0') ch(*s++);
+    }
+
+    /// Left-aligned string, space-padded to width (like printf's %-Ns).
+    void strPadded(const char* s, int width) noexcept {
+        if (s == nullptr) s = "(null)";
+        int n = 0;
+        while (s[n] != '\0') ch(s[n++]);
+        while (n++ < width) ch(' ');
+    }
+
+    void dec(uint64_t v, int minDigits = 1) noexcept {
+        char tmp[20];
+        int n = 0;
+        do { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v != 0 && n < 20);
+        while (n < minDigits && n < 20) tmp[n++] = '0';
+        while (n > 0) ch(tmp[--n]);
+    }
+
+    void decSigned(int64_t v) noexcept {
+        if (v < 0) { ch('-'); dec(static_cast<uint64_t>(-(v + 1)) + 1); }
+        else       { dec(static_cast<uint64_t>(v)); }
+    }
+
+    void hex(uint64_t v, int minDigits = 1) noexcept {
+        char tmp[16];
+        int n = 0;
+        do { tmp[n++] = "0123456789ABCDEF"[v & 0xF]; v >>= 4; } while (v != 0 && n < 16);
+        while (n < minDigits && n < 16) tmp[n++] = '0';
+        str("0x");
+        while (n > 0) ch(tmp[--n]);
+    }
 };
 
-inline CrashContext& crashContext() noexcept {
-    static CrashContext ctx;
-    return ctx;
+/// "YYYY-MM-DD HH:MM:SS.mmm UTC" — computed by hand because localtime_r()
+/// and gmtime_r() are not async-signal-safe.
+inline void writeUtcTimestamp(SignalSafeWriter& w) noexcept {
+    timespec ts{};
+    ::clock_gettime(CLOCK_REALTIME, &ts);
+    const int64_t secs = static_cast<int64_t>(ts.tv_sec);
+    int64_t days       = secs / 86400;
+    int64_t rem        = secs % 86400;
+    if (rem < 0) { rem += 86400; --days; }
+
+    // Days since 1970-01-01 -> civil date (Howard Hinnant's algorithm).
+    days += 719468;
+    const int64_t  era = (days >= 0 ? days : days - 146096) / 146097;
+    const uint64_t doe = static_cast<uint64_t>(days - era * 146097);
+    const uint64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const uint64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const uint64_t mp  = (5 * doy + 2) / 153;
+    const uint64_t day = doy - (153 * mp + 2) / 5 + 1;
+    const uint64_t mon = mp < 10 ? mp + 3 : mp - 9;
+    const int64_t  yr  = static_cast<int64_t>(yoe) + era * 400 + (mon <= 2 ? 1 : 0);
+
+    w.decSigned(yr);             w.ch('-');
+    w.dec(mon, 2);               w.ch('-');
+    w.dec(day, 2);               w.ch(' ');
+    w.dec(static_cast<uint64_t>(rem / 3600), 2);        w.ch(':');
+    w.dec(static_cast<uint64_t>(rem % 3600 / 60), 2);   w.ch(':');
+    w.dec(static_cast<uint64_t>(rem % 60), 2);          w.ch('.');
+    w.dec(static_cast<uint64_t>(ts.tv_nsec / 1000000), 3);
+    w.str(" UTC");
 }
 
+inline const char* signalName(int sig) noexcept {
+    switch (sig) {
+        case SIGSEGV: return "SIGSEGV";
+        case SIGBUS:  return "SIGBUS";
+        case SIGILL:  return "SIGILL";
+        case SIGFPE:  return "SIGFPE";
+        case SIGABRT: return "SIGABRT";
+        default:      return "UNKNOWN";
+    }
+}
+
+/// One "NAME=0x0000000000000000" cell; three per line.
+inline void writeReg(SignalSafeWriter& w, const char* name, uint64_t value, int& column) noexcept {
+    w.strPadded(name, 3);
+    w.ch('=');
+    w.hex(value, 16);
+    if (++column % 3 == 0) w.ch('\n');
+    else                   w.str("  ");
+}
+
+/// Register dump from the signal's ucontext. Architectures not listed here
+/// simply get no register section.
+inline void writeRegisters(SignalSafeWriter& w, void* uctxRaw) noexcept {
+    if (uctxRaw == nullptr) return;
+    [[maybe_unused]] auto* uc = static_cast<ucontext_t*>(uctxRaw);
+    int col = 0;
+
+#if defined(__linux__) && defined(__x86_64__)
+    const greg_t* g = uc->uc_mcontext.gregs;
+    static constexpr struct { const char* name; int idx; } kRegs[] = {
+        {"RAX", REG_RAX}, {"RBX", REG_RBX}, {"RCX", REG_RCX},
+        {"RDX", REG_RDX}, {"RSI", REG_RSI}, {"RDI", REG_RDI},
+        {"RSP", REG_RSP}, {"RBP", REG_RBP}, {"RIP", REG_RIP},
+        {"R8",  REG_R8},  {"R9",  REG_R9},  {"R10", REG_R10},
+        {"R11", REG_R11}, {"R12", REG_R12}, {"R13", REG_R13},
+        {"R14", REG_R14}, {"R15", REG_R15},
+    };
+    w.str("\n--- Registers (x86_64) ---\n");
+    for (const auto& r : kRegs) writeReg(w, r.name, static_cast<uint64_t>(g[r.idx]), col);
+
+#elif defined(__linux__) && defined(__aarch64__)
+    const auto& mc = uc->uc_mcontext;
+    static constexpr const char* kNames[29] = {
+        "X0",  "X1",  "X2",  "X3",  "X4",  "X5",  "X6",  "X7",  "X8",  "X9",
+        "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18", "X19",
+        "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28",
+    };
+    w.str("\n--- Registers (arm64) ---\n");
+    for (int i = 0; i < 29; ++i) writeReg(w, kNames[i], static_cast<uint64_t>(mc.regs[i]), col);
+    writeReg(w, "FP", static_cast<uint64_t>(mc.regs[29]), col);
+    writeReg(w, "LR", static_cast<uint64_t>(mc.regs[30]), col);
+    writeReg(w, "SP", static_cast<uint64_t>(mc.sp), col);
+    writeReg(w, "PC", static_cast<uint64_t>(mc.pc), col);
+
+#elif defined(__APPLE__) && defined(__x86_64__)
+    const auto& ss = uc->uc_mcontext->__ss;
+    w.str("\n--- Registers (x86_64) ---\n");
+    writeReg(w, "RAX", ss.__rax, col); writeReg(w, "RBX", ss.__rbx, col); writeReg(w, "RCX", ss.__rcx, col);
+    writeReg(w, "RDX", ss.__rdx, col); writeReg(w, "RSI", ss.__rsi, col); writeReg(w, "RDI", ss.__rdi, col);
+    writeReg(w, "RSP", ss.__rsp, col); writeReg(w, "RBP", ss.__rbp, col); writeReg(w, "RIP", ss.__rip, col);
+    writeReg(w, "R8",  ss.__r8,  col); writeReg(w, "R9",  ss.__r9,  col); writeReg(w, "R10", ss.__r10, col);
+    writeReg(w, "R11", ss.__r11, col); writeReg(w, "R12", ss.__r12, col); writeReg(w, "R13", ss.__r13, col);
+    writeReg(w, "R14", ss.__r14, col); writeReg(w, "R15", ss.__r15, col);
+
+#elif defined(__APPLE__) && defined(__aarch64__)
+    const auto& ss = uc->uc_mcontext->__ss;
+    static constexpr const char* kNames[29] = {
+        "X0",  "X1",  "X2",  "X3",  "X4",  "X5",  "X6",  "X7",  "X8",  "X9",
+        "X10", "X11", "X12", "X13", "X14", "X15", "X16", "X17", "X18", "X19",
+        "X20", "X21", "X22", "X23", "X24", "X25", "X26", "X27", "X28",
+    };
+    w.str("\n--- Registers (arm64) ---\n");
+    for (int i = 0; i < 29; ++i) writeReg(w, kNames[i], static_cast<uint64_t>(ss.__x[i]), col);
+    // fp/lr/sp/pc may be pointer-authenticated/opaque; the SDK accessors handle that.
+    writeReg(w, "FP", static_cast<uint64_t>(__darwin_arm_thread_state64_get_fp(ss)), col);
+    writeReg(w, "LR", static_cast<uint64_t>(__darwin_arm_thread_state64_get_lr(ss)), col);
+    writeReg(w, "SP", static_cast<uint64_t>(__darwin_arm_thread_state64_get_sp(ss)), col);
+    writeReg(w, "PC", static_cast<uint64_t>(__darwin_arm_thread_state64_get_pc(ss)), col);
+#endif
+
+    if (col % 3 != 0) w.ch('\n');
+}
+
+} // namespace detail
+
+#endif // _WIN32
+
+// ---------------------------------------------------------------------------
+// CrashHandler — singleton
+// ---------------------------------------------------------------------------
 class CrashHandler {
 public:
     // Meyers' singleton
@@ -151,9 +509,63 @@ public:
     // Call once at startup (idempotent).
     inline void init() noexcept {
         if (initialized_) return;
-        openLogFile();
-        ::SetUnhandledExceptionFilter(&CrashHandler::sehFilter);
+#ifdef _WIN32
+        file_ = detail::openLogFile(kCrashLogName, path_, sizeof(path_));
+        prevFilter_ = ::SetUnhandledExceptionFilter(&CrashHandler::sehFilter);
+#else
+        openLogFd();
+        for (int i = 0; i < kNumSignals; ++i) {
+            struct sigaction sa{};
+            sa.sa_sigaction = &CrashHandler::signalHandler;
+            ::sigemptyset(&sa.sa_mask);
+            // SA_ONSTACK: use the thread's alternate stack if it has one (Crashpad
+            // sets one up), so a stack overflow can still be reported.
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            installed_[i] = ::sigaction(kSignals[i], &sa, &prev_[i]) == 0;
+        }
+#endif
         initialized_ = true;
+    }
+
+    // Puts back the handler(s) that were there before init(). Must run before
+    // the mod's library is unloaded: a handler left installed would point into
+    // unmapped memory and turn the next crash anywhere in the game into a
+    // second, unreported one.
+    inline void shutdown() noexcept {
+        if (!initialized_) return;
+#ifdef _WIN32
+        LPTOP_LEVEL_EXCEPTION_FILTER current = ::SetUnhandledExceptionFilter(prevFilter_);
+        if (current != &CrashHandler::sehFilter) {
+            // Someone installed their own filter after us — leave theirs in place.
+            ::SetUnhandledExceptionFilter(current);
+        }
+        prevFilter_ = nullptr;
+        if (file_) { std::fclose(file_); file_ = nullptr; }
+#else
+        for (int i = 0; i < kNumSignals; ++i) {
+            if (!installed_[i]) continue;
+            struct sigaction current{};
+            // Only restore if ours is still the active handler — never clobber
+            // one installed after us.
+            if (::sigaction(kSignals[i], nullptr, &current) == 0 &&
+                (current.sa_flags & SA_SIGINFO) != 0 &&
+                current.sa_sigaction == &CrashHandler::signalHandler) {
+                ::sigaction(kSignals[i], &prev_[i], nullptr);
+            }
+            installed_[i] = false;
+        }
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+#endif
+        initialized_ = false;
+    }
+
+    /// Path of the crash log, or nullptr if it could not be opened.
+    const char* logPath() const noexcept {
+#ifdef _WIN32
+        return file_ ? path_ : nullptr;
+#else
+        return fd_ >= 0 ? path_ : nullptr;
+#endif
     }
 
     CrashHandler(const CrashHandler&)            = delete;
@@ -161,32 +573,9 @@ public:
 
 private:
     CrashHandler()  = default;
-    ~CrashHandler() {
-        if (file_) { std::fclose(file_); file_ = nullptr; }
-    }
+    ~CrashHandler() { shutdown(); }
 
-    // -----------------------------------------------------------------------
-    // Open the crash log next to the running executable
-    // -----------------------------------------------------------------------
-    inline void openLogFile() noexcept {
-        char path[kPathBufSize];
-        DWORD len = ::GetModuleFileNameA(nullptr, path, kPathBufSize);
-        if (len == 0 || len >= kPathBufSize) {
-            // Fallback: write to CWD
-            file_ = std::fopen("hiveshock_crash.log", "a");
-        } else {
-            // Strip the executable name to get the directory
-            char* lastSlash = std::strrchr(path, '\\');
-            if (lastSlash) *(lastSlash + 1) = '\0';
-            std::strncat(path, "hiveshock_crash.log", kPathBufSize - std::strlen(path) - 1);
-            file_ = std::fopen(path, "a");
-        }
-        if (file_) {
-            // Fully unbuffered — every write goes straight to the OS
-            std::setvbuf(file_, nullptr, _IONBF, 0);
-        }
-    }
-
+#ifdef _WIN32
     // -----------------------------------------------------------------------
     // SEH callback — must avoid ALL heap allocations
     // -----------------------------------------------------------------------
@@ -299,11 +688,139 @@ private:
         // Force flush — the whole point of this module
         std::fflush(f);
 
-        // Let Windows handle the rest (usually WER / crash dialog)
+        // Hand the crash on to the filter that was there before us (Dusklight's
+        // crash reporter); with none, let Windows handle it (WER / crash dialog).
+        if (self.prevFilter_ != nullptr) {
+            return self.prevFilter_(ep);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    FILE* file_        = nullptr;
+    FILE*                         file_       = nullptr;
+    LPTOP_LEVEL_EXCEPTION_FILTER  prevFilter_ = nullptr;
+
+#else // POSIX
+
+    static constexpr int kNumSignals = 5;
+    static constexpr int kSignals[kNumSignals] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
+
+    inline void openLogFd() noexcept {
+        if (!detail::buildLogPath(path_, sizeof(path_), kCrashLogName)) {
+            path_[0] = '\0';
+            detail::appendPath(path_, sizeof(path_), kCrashLogName);
+        }
+        fd_ = ::open(path_, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    }
+
+    // -----------------------------------------------------------------------
+    // Signal handler — async-signal-safe only: no stdio, no heap, no locks.
+    // -----------------------------------------------------------------------
+    static void signalHandler(int sig, siginfo_t* info, void* uctx) noexcept {
+        const int savedErrno = errno;
+        CrashHandler& self = instance();
+
+        // A crash while writing the report (or on a second thread at the same
+        // time) skips straight to the previous handler.
+        if (!inHandler_.exchange(true)) {
+            self.writeReport(sig, info, uctx);
+        }
+
+        errno = savedErrno;
+        self.chain(sig, info, uctx);
+    }
+
+    void writeReport(int sig, siginfo_t* info, void* uctx) const noexcept {
+        detail::SignalSafeWriter w(fd_ >= 0 ? fd_ : STDERR_FILENO);
+
+        // -- Header ----------------------------------------------------------
+        w.str("\n========================================\n HIVESHOCK CRASH REPORT\n ");
+        detail::writeUtcTimestamp(w);
+        w.str("\n========================================\n");
+
+        // -- Signal info -----------------------------------------------------
+        w.str("Signal    : "); w.dec(static_cast<uint64_t>(sig));
+        w.str(" (");          w.str(detail::signalName(sig)); w.str(")\n");
+        if (info != nullptr) {
+            w.str("Code      : "); w.decSigned(info->si_code); w.ch('\n');
+            w.str("Fault addr: "); w.hex(reinterpret_cast<uintptr_t>(info->si_addr)); w.ch('\n');
+        }
+        w.str("Tick      : "); w.dec(monotonicMs()); w.ch('\n');
+
+        // -- Context pointers ------------------------------------------------
+        const CrashContext& ctx = crashContext();
+        w.str("\n--- Key State ---\nPlayer ptr : ");
+        w.hex(reinterpret_cast<uintptr_t>(ctx.playerPtr));
+        w.str("\nStage      : "); w.str(ctx.stageName); w.ch('\n');
+
+        // -- Register dump ---------------------------------------------------
+        detail::writeRegisters(w, uctx);
+
+        // -- Command ring buffer dump ----------------------------------------
+        w.str("\n--- Last "); w.dec(kCommandRingSize); w.str(" Commands ---\n");
+        const CommandRing& ring = commandRing();
+        const uint32_t headVal = ring.head.load(std::memory_order_relaxed);
+        // Walk the ring from oldest to newest
+        const uint32_t start = (headVal >= kCommandRingSize) ? (headVal - kCommandRingSize) : 0;
+        for (uint32_t i = start; i < headVal; ++i) {
+            const CommandRecord& rec = ring.entries[i % kCommandRingSize];
+            w.str("  [");
+            if (i % kCommandRingSize < 10) w.ch(' ');
+            w.dec(i % kCommandRingSize);
+            w.str("] cmd=");     w.strPadded(rec.commandId, 40);
+            w.str(" sender=");   w.strPadded(rec.sender, 20);
+            w.str(" tick=");     w.dec(rec.tickCount);
+            w.ch('\n');
+        }
+
+        w.str("========================================\n END CRASH REPORT\n"
+              "========================================\n\n");
+        w.flush();
+    }
+
+    // Hands the signal to whatever was installed before us (Dusklight's crash
+    // reporter), or terminates with the default action if there was nothing.
+    void chain(int sig, siginfo_t* info, void* uctx) const noexcept {
+        int idx = -1;
+        for (int i = 0; i < kNumSignals; ++i) {
+            if (kSignals[i] == sig) { idx = i; break; }
+        }
+
+        if (idx >= 0 && installed_[idx]) {
+            const struct sigaction prev = prev_[idx];
+            // Restore it first, so a re-fault after we return goes straight to it.
+            ::sigaction(sig, &prev, nullptr);
+
+            if ((prev.sa_flags & SA_SIGINFO) != 0) {
+                if (prev.sa_sigaction != nullptr) {
+                    prev.sa_sigaction(sig, info, uctx);
+                    return;
+                }
+            } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) {
+                prev.sa_handler(sig);
+                return;
+            }
+        }
+
+        // Default disposition (SIG_IGN is treated the same: ignoring a fault
+        // would just re-fault forever). The raised signal stays pending while
+        // this handler runs and is delivered — terminating the process — as
+        // soon as it returns.
+        struct sigaction dfl{};
+        dfl.sa_handler = SIG_DFL;
+        ::sigemptyset(&dfl.sa_mask);
+        ::sigaction(sig, &dfl, nullptr);
+        ::raise(sig);
+    }
+
+    static inline std::atomic<bool> inHandler_{false};
+
+    int              fd_ = -1;
+    struct sigaction prev_[kNumSignals]{};
+    bool             installed_[kNumSignals]{};
+
+#endif // _WIN32
+
+    char  path_[kPathBufSize]{};
     bool  initialized_ = false;
 };
 
@@ -358,24 +875,15 @@ public:
         std::fflush(file_);
     }
 
+    /// Path of the log file, or nullptr if it could not be opened.
+    const char* path() const noexcept { return file_ ? path_ : nullptr; }
+
     ForensicLog(const ForensicLog&)            = delete;
     ForensicLog& operator=(const ForensicLog&) = delete;
 
 private:
     ForensicLog() noexcept {
-        char path[kPathBufSize];
-        DWORD len = ::GetModuleFileNameA(nullptr, path, kPathBufSize);
-        if (len == 0 || len >= kPathBufSize) {
-            file_ = std::fopen("hiveshock_forensic.log", "a");
-        } else {
-            char* lastSlash = std::strrchr(path, '\\');
-            if (lastSlash) *(lastSlash + 1) = '\0';
-            std::strncat(path, "hiveshock_forensic.log", kPathBufSize - std::strlen(path) - 1);
-            file_ = std::fopen(path, "a");
-        }
-        if (file_) {
-            std::setvbuf(file_, nullptr, _IONBF, 0);
-        }
+        file_ = detail::openLogFile(kForensicLogName, path_, sizeof(path_));
     }
 
     ~ForensicLog() {
@@ -383,13 +891,14 @@ private:
     }
 
     FILE*       file_ = nullptr;
+    char        path_[kPathBufSize]{};
     std::mutex  mutex_;
 };
 
 } // namespace hiveshock
 
 // ---------------------------------------------------------------------------
-// Convenience macros — Windows
+// Convenience macros
 // ---------------------------------------------------------------------------
 #define HIVESHOCK_TRACE(fmt, ...) \
     ::hiveshock::ForensicLog::instance().trace(fmt, ##__VA_ARGS__)
@@ -399,21 +908,3 @@ private:
 
 #define HIVESHOCK_RECORD_CMD(commandId, senderName) \
     ::hiveshock::commandRing().record(commandId, senderName)
-
-#else // !_WIN32
-
-// ---------------------------------------------------------------------------
-// Non-Windows fallbacks — degrade gracefully
-// ---------------------------------------------------------------------------
-#include <cstdio>
-
-#define HIVESHOCK_TRACE(fmt, ...) \
-    std::fprintf(stderr, "[HiveShock] " fmt "\n", ##__VA_ARGS__)
-
-#define HIVESHOCK_CHECKPOINT(label) \
-    std::fprintf(stderr, "[HiveShock] ** CHECKPOINT: %s **\n", (label))
-
-#define HIVESHOCK_RECORD_CMD(commandId, senderName) \
-    ((void)0)
-
-#endif // _WIN32

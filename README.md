@@ -36,7 +36,22 @@ Download the `.dusk` for your platform from [Releases](../../releases) and copy 
 - macOS: `~/Library/Application Support/TwilitRealm/Dusklight/mods`
 
 A native `.dusk` carries the library of the platform it was built on, so each release has one file per platform
-(`HiveShock-Dusklight-<version>-win-x64.dusk`). Currently only Windows x64 is published.
+(`HiveShock-Dusklight-<version>-<platform>.dusk`): `win-x64`, `linux-x64`, `linux-arm64`, `macos-arm64` (Apple
+Silicon) and `macos-x64` (Intel).
+
+On macOS the first start may ask whether Dusklight can accept incoming network connections; allow it, or the
+TCP port won't be reachable.
+
+## Logs
+Besides the Dusklight log, HiveShock writes `hiveshock_forensic.log` (a trace of every command) and, if the game
+crashes, `hiveshock_crash.log` (last 16 commands, registers, fault address):
+
+- Windows: next to `dusklight.exe`.
+- Linux/macOS: the mod's data folder, `<Dusklight config>/mod_data/com.hiveshock.interactive/`. The exact paths are
+  printed in the Dusklight log at startup.
+
+On Windows a crash inside an effect is caught and the game keeps running. Linux and macOS cannot recover from a
+fault the same way: the crash is logged and the game closes.
 
 ## Build
 ```

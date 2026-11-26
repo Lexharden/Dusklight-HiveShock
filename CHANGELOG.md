@@ -2,6 +2,16 @@
 
 Versioning: [SemVer](https://semver.org). The version lives in `mod.json`; tag releases as `vX.Y.Z`.
 
+## Unreleased
+
+### Added
+- Linux (x64, arm64) and macOS (Apple Silicon, Intel) builds.
+- Forensic log and crash report on Linux/macOS: written to the mod's data folder (`<Dusklight config>/mod_data/com.hiveshock.interactive/`). Its exact path is printed in the Dusklight log at startup.
+
+### Fixed
+- The crash handler is removed on shutdown (and when initialisation fails), so a later crash after disabling the mod no longer jumps into an unloaded library.
+- Windows: after writing `hiveshock_crash.log`, the crash is passed on to Dusklight's own crash reporter instead of replacing it.
+
 ## 1.2.0
 
 ### Added
